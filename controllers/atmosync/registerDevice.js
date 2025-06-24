@@ -24,13 +24,13 @@ const registerDevice = async (req, res) => {
     }
     try {
         // Check if the device already exists in the database
-        const FIND_DEVICE = `SELECT * FROM devices WHERE device_name = ?`;
-        const [rows] = await db.promise().query(FIND_DEVICE, [device_name]);
+        const FIND_DEVICE = `SELECT * FROM devices WHERE device_name = ? AND device_mac_address = ?`;
+        const [rows] = await db.promise().query(FIND_DEVICE, [device_name, device_mac_address]);
 
         //update the existing device with new IP Address and Status and last_connected_time
         if (rows.length > 0) {
-            const UPDATE_DEVICE = `UPDATE devices SET device_ip_address = ?, device_status = 'online', device_last_connected = NOW() WHERE device_name = ?`;
-            await db.promise().query(UPDATE_DEVICE, [device_ip_address, device_name]);
+            const UPDATE_DEVICE = `UPDATE devices SET device_ip_address = ?, device_status = 'online', device_last_connected = NOW() WHERE device_name = ? AND device_mac_address = ?`;
+            await db.promise().query(UPDATE_DEVICE, [device_ip_address, device_name, device_mac_address]);
             return res.status(200).send('Device updated successfully');
         } else {
             // device_last_connected implies the last time the device hit /registerDevice endpoint 

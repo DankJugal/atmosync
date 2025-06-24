@@ -1,5 +1,5 @@
 const db = require('mysql2');
-const hubvolt = db.createPool({
+const atmosync = db.createPool({
     host : "localhost",
     user : "root",
     password : "6103",
