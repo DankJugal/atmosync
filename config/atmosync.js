@@ -1,8 +1,8 @@
 const db = require('mysql2');
-const atmosync = db.createPool({
+const atmosync_db_connect = db.createPool({
     host : "localhost",
     user : "root",
-    password : "6103",
+    password : "",
     database : "atmosync",
 });
-module.exports = atmosync;
+module.exports = atmosync_db_connect;

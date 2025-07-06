@@ -1,132 +1,224 @@
 const express = require('express');
 const axios = require('axios');
-const db = require('./config/atmosync'); // MySQL connection
-const router = require('./router/atmosync'); // API routes
+const db = require('./config/atmosync');
+const router = require('./router/atmosync');
+const cors = require('cors');
+const moment = require('moment-timezone');
+const logger = require('./logger');
+const readinglogger = require('./readinglogger');
+require('./cronJob');
+
 const app = express();
 const PORT = 4000;
-const cors = require('cors');
 
 app.use(express.json());
 app.use(express.text());
 app.use(cors());
-app.use('/atmosync', router); 
+app.use('/atmosync', router);
 
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  logger.info(`Server started and listening on port ${PORT}`);
 });
 
-// Track active polling intervals
-const pollingMap = new Map(); // device_name -> { intervalId, frequency }
+// --- Echo Function ---
+const echoAllDevices = async () => {
+  // Step 1: Echo ONLINE devices
+  db.query(`SELECT device_name, device_ip_address FROM devices WHERE device_status = 'online'`, (err, devicesOnline) => {
+    if (err) return logger.error('Error fetching online devices:', err);
 
-const pollDevice = (device) => {
-  const { device_name, device_ip_address, device_call_frequency } = device;
-  const frequencyMs = device_call_frequency * 1000;
+    devicesOnline.forEach(async (device) => {
+      try {
+        const res = await axios.post(`http://${device.device_ip_address}/`, 'ECHO XYZ', {
+          headers: { 'Content-Type': 'text/plain' },
+          timeout: 5000,
+        });
 
-  const intervalId = setInterval(async () => {
-    const unixTimestamp = Math.floor(Date.now() / 1000);
-    const mysqlDatetime = new Date(unixTimestamp * 1000)
-      .toISOString()
-      .slice(0, 19)
-      .replace('T', ' ');
-
-    const payload = `SENSE ${unixTimestamp}`;
-
-    try {
-      const response = await axios.post(`http://${device_ip_address}/`, payload, {
-        headers: { 'Content-Type': 'text/plain' },
-        timeout: 10000,
-      });
-
-      const data = response.data.trim();
-      const match = data.match(/^(\S+)\s+(\d+)\s+Temp:\s*([\d.]+)\s+Humidity:\s*([\d.]+)/);
-
-      if (!match) {
-        console.error(`Invalid response from ${device_name}: ${data}`);
-        return;
-      }
-
-      const [, receivedDeviceName, sentTimestamp, temperature, humidity] = match;
-
-      const INSERT_QUERY = `
-        INSERT INTO readings (device_name, device_temperature, device_humidity, timestamp)
-        VALUES (?, ?, ?, ?)
-      `;
-
-      db.query(INSERT_QUERY, [receivedDeviceName, temperature, humidity, mysqlDatetime], (err) => {
-        if (err) {
-          console.error(`DB Insert Error for ${receivedDeviceName}:`, err);
+        if (res.data && typeof res.data === 'string') {
+          db.query(`UPDATE devices SET device_status = 'online' WHERE device_name = ?`, [device.device_name]);
         } else {
-          console.log(`${receivedDeviceName} | Temp: ${temperature}, Hum: ${humidity}, Time: ${mysqlDatetime}`);
+          throw new Error('Invalid response');
         }
-      });
+      } catch (err) {
+        db.query(
+          `UPDATE devices SET device_status = 'offline', device_last_connected = NOW()
+           WHERE device_name = ? AND device_status != 'offline'`,
+          [device.device_name],
+          (updateErr, result) => {
+            if (updateErr) logger.error(`Error updating offline status for ${device.device_name}:`, updateErr);
+            else if (result.affectedRows > 0) {
+              logger.warn(`Device ${device.device_name} marked offline`);
+            }
+          }
+        );
+      }
+    });
+  });
 
-      const UPDATE_QUERY = `
-        UPDATE devices SET device_status = 'online', device_last_connected = NOW()
-        WHERE device_name = ?
-      `;
-      db.query(UPDATE_QUERY, [device_name]);
+  // Step 2: Echo OFFLINE devices to see if any came back
+  db.query(`SELECT device_name, device_ip_address FROM devices WHERE device_status = 'offline'`, (err, devicesOffline) => {
+    if (err) return logger.error('Error fetching offline devices:', err);
 
-    } catch (err) {
-      console.error(`Error polling ${device_name}: ${err.message}`);
-      const UPDATE_QUERY = `
-        UPDATE devices SET device_status = 'offline', device_last_connected = NOW()
-        WHERE device_name = ?
-      `;
-      db.query(UPDATE_QUERY, [device_name]);
-    }
+    devicesOffline.forEach(async (device) => {
+      try {
+        const res = await axios.post(`http://${device.device_ip_address}/`, 'ECHO XYZ', {
+          headers: { 'Content-Type': 'text/plain' },
+          timeout: 5000,
+        });
 
-  }, frequencyMs);
-
-  pollingMap.set(device_name, { intervalId, frequency: device_call_frequency });
+        if (res.data && typeof res.data === 'string') {
+          db.query(
+            `UPDATE devices SET device_status = 'online' WHERE device_name = ? AND device_status != 'online'`,
+            [device.device_name],
+            (updateErr, result) => {
+              if (updateErr) logger.error(`Error updating status to online for ${device.device_name}:`, updateErr);
+              else if (result.affectedRows > 0) {
+                logger.info(`Device ${device.device_name} came back online`);
+              }
+            }
+          );
+        }
+      } catch (err) {
+        // No need to log repeated offline failures here
+      }
+    });
+  });
 };
 
-const syncDevicePolling = () => {
+setInterval(echoAllDevices, 300000); // every 5 minutes
+
+// --- Sensor Watcher Map ---
+const sensorWatcherMap = new Map(); // device_name -> { intervalId, frequency }
+
+const startSensorWatcher = (device) => {
+  const { device_name, device_ip_address, device_call_frequency } = device;
+  const frequencyMs = device_call_frequency * 1000;
+  let failureCount = 0;
+  let isRunning = false;
+
+  const tryReadSensorData = async () => {
+    return new Promise((resolve) => {
+      db.query(`SELECT device_status FROM devices WHERE device_name = ?`, [device_name], async (err, results) => {
+        if (err || !results.length || results[0].device_status !== 'online') {
+          const watcher = sensorWatcherMap.get(device_name);
+          if (watcher) {
+            clearInterval(watcher.intervalId);
+            sensorWatcherMap.delete(device_name);
+            logger.warn(`Watcher for ${device_name} stopped: device is offline`);
+          }
+          return resolve(false);
+        }
+
+        // Proceed to read sensor data
+        const mysqlDatetime = moment().tz("Asia/Kolkata").format("YYYY-MM-DD HH:mm:ss");
+        const unixTimestamp = Math.floor(Date.now() / 1000);
+        const payload = `SENSE ${unixTimestamp}`;
+
+        try {
+          const response = await axios.post(`http://${device_ip_address}/`, payload, {
+            headers: { 'Content-Type': 'text/plain' },
+            timeout: 10000,
+          });
+
+          const data = response.data.trim();
+          const match = data.match(/^(\S+)\s+(\d+)\s*([\d.]+)C\s*([\d.]+)%RH/);
+          if (!match) throw new Error(`Invalid response format: ${data}`);
+
+          const [, receivedDeviceName, , temperature, humidity] = match;
+
+          db.query(
+            `INSERT INTO readings (device_name, device_temperature, device_humidity, timestamp) VALUES (?, ?, ?, ?)`,
+            [receivedDeviceName, temperature, humidity, mysqlDatetime],
+            (err) => {
+              if (err) logger.error(`Insert error for ${receivedDeviceName}:`, err);
+              else readinglogger.info(`${receivedDeviceName} | Temperature: ${temperature}, Humidity: ${humidity}`);
+            }
+          );
+          resolve(true);
+        } catch (err) {
+          logger.warn(`Reading failed for ${device_name}: ${err.message}`);
+          resolve(false);
+        }
+      });
+    });
+  };
+
+  const intervalId = setInterval(async () => {
+    if (isRunning) return; // prevent concurrent runs
+    isRunning = true;
+
+    const success = await tryReadSensorData();
+
+    if (success) {
+      failureCount = 0;
+    } else {
+      failureCount++;
+      if (failureCount >= 2) {
+        db.query(
+          `UPDATE devices SET device_status = 'offline', device_last_connected = NOW()
+           WHERE device_name = ? AND device_status != 'offline'`,
+          [device_name],
+          (err, result) => {
+            if (err) logger.error(`Error marking ${device_name} offline:`, err);
+            else if (result.affectedRows > 0) {
+              logger.warn(`Device ${device_name} marked offline after 2 failed attempts`);
+            }
+          }
+        );
+        clearInterval(intervalId);
+        sensorWatcherMap.delete(device_name);
+        logger.warn(`Stopped sensor watcher for ${device_name}`);
+      }
+    }
+
+    isRunning = false; // release lock
+  }, frequencyMs);
+
+  sensorWatcherMap.set(device_name, { intervalId, frequency: device_call_frequency });
+};
+
+const syncSensorWatchers = () => {
   const DEVICE_QUERY = `
     SELECT device_name, device_ip_address, device_call_frequency
     FROM devices
-    WHERE device_ip_address IS NOT NULL
+    WHERE device_ip_address IS NOT NULL AND device_status = 'online'
   `;
 
   db.query(DEVICE_QUERY, (err, devices) => {
     if (err) {
-      console.error('Error fetching devices:', err);
+      logger.error('Error fetching devices for watcher sync:', err);
       return;
     }
 
+    const activeDeviceNames = new Set();
+
     devices.forEach(device => {
       const { device_name, device_call_frequency } = device;
+      activeDeviceNames.add(device_name);
 
-      if (!pollingMap.has(device_name)) {
-        // First-time device, start polling
-        console.log(`Starting polling for ${device_name} at ${device_call_frequency}s`);
-        pollDevice(device);
+      if (!sensorWatcherMap.has(device_name)) {
+        logger.info(`Starting sensor watcher for ${device_name}`);
+        startSensorWatcher(device);
       } else {
-        const { intervalId, frequency } = pollingMap.get(device_name);
-
+        const { intervalId, frequency } = sensorWatcherMap.get(device_name);
         if (frequency !== device_call_frequency) {
-          // Frequency changed, restart interval
-          console.log(`Updating polling interval for ${device_name}: ${frequency}s → ${device_call_frequency}s`);
+          logger.info(`Updating sensor watcher for ${device_name}: ${frequency}s → ${device_call_frequency}s`);
           clearInterval(intervalId);
-          pollingMap.delete(device_name);
-          pollDevice(device);
+          sensorWatcherMap.delete(device_name);
+          startSensorWatcher(device);
         }
       }
     });
 
-    // Stop polling for devices removed from DB
-    for (const name of pollingMap.keys()) {
-      if (!devices.find(d => d.device_name === name)) {
-        const { intervalId } = pollingMap.get(name);
-        console.log(`Stopping polling for deleted device ${name}`);
+    for (const name of sensorWatcherMap.keys()) {
+      if (!activeDeviceNames.has(name)) {
+        const { intervalId } = sensorWatcherMap.get(name);
         clearInterval(intervalId);
-        pollingMap.delete(name);
+        sensorWatcherMap.delete(name);
+        logger.warn(`Stopped sensor watcher for ${name} (offline or removed)`);
       }
     }
   });
 };
 
-// Run initial sync
-syncDevicePolling();
-
-// Resync every 60 seconds to adapt to DB changes
-setInterval(syncDevicePolling, 60000);
+syncSensorWatchers();
+setInterval(syncSensorWatchers, 60000); // every 60s
